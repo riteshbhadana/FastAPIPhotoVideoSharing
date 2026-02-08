@@ -1,31 +1,57 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from fastapi.middleware.cors import CORSMiddleware
+
 from app.schemas import PostCreate, PostResponse, UserRead, UserCreate, UserUpdate
 from app.db import Post, create_db_and_tables, get_async_session, User
-from sqlalchemy.ext.asyncio import AsyncSession
-from contextlib import asynccontextmanager
-from sqlalchemy import select
+from app.users import auth_backend, current_active_user, fastapi_users
 from app.images import imagekit
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from contextlib import asynccontextmanager
 from imagekitio.models.UploadFileRequestOptions import UploadFileRequestOptions
+
 import shutil
 import os
 import uuid
 import tempfile
-from app.users import auth_backend, current_active_user, fastapi_users
 
 
+# ---------------- Lifespan ----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await create_db_and_tables()
     yield
 
+
+# ---------------- App ----------------
 app = FastAPI(lifespan=lifespan)
 
+# ✅ CORS FIX (important)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # allow frontend access
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------- Auth Routers ----------------
 app.include_router(fastapi_users.get_auth_router(auth_backend), prefix='/auth/jwt', tags=["auth"])
 app.include_router(fastapi_users.get_register_router(UserRead, UserCreate), prefix="/auth", tags=["auth"])
 app.include_router(fastapi_users.get_reset_password_router(), prefix="/auth", tags=["auth"])
 app.include_router(fastapi_users.get_verify_router(UserRead), prefix="/auth", tags=["auth"])
 app.include_router(fastapi_users.get_users_router(UserRead, UserUpdate), prefix="/users", tags=["users"])
 
+
+# Optional homepage
+@app.get("/")
+def root():
+    return {"message": "FastAPI backend running 🚀"}
+
+
+# ---------------- Upload ----------------
 @app.post("/upload")
 async def upload_file(
         file: UploadFile = File(...),
@@ -64,44 +90,51 @@ async def upload_file(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             os.unlink(temp_file_path)
         file.file.close()
 
+
+# ---------------- Feed ----------------
 @app.get("/feed")
 async def get_feed(
         session: AsyncSession = Depends(get_async_session),
         user: User = Depends(current_active_user),
 ):
     result = await session.execute(select(Post).order_by(Post.created_at.desc()))
-    posts = [row[0] for row in result.all()]
+    posts = result.scalars().all()
 
     result = await session.execute(select(User))
-    users = [row[0] for row in result.all()]
+    users = result.scalars().all()
     user_dict = {u.id: u.email for u in users}
 
-    posts_data = []
-    for post in posts:
-        posts_data.append(
-            {
-                "id": str(post.id),
-                "user_id": str(post.user_id),
-                "caption": post.caption,
-                "url": post.url,
-                "file_type": post.file_type,
-                "file_name": post.file_name,
-                "created_at": post.created_at.isoformat(),
-                "is_owner": post.user_id == user.id,
-                "email": user_dict.get(post.user_id, "Unknown")
-            }
-        )
+    posts_data = [
+        {
+            "id": str(post.id),
+            "user_id": str(post.user_id),
+            "caption": post.caption,
+            "url": post.url,
+            "file_type": post.file_type,
+            "file_name": post.file_name,
+            "created_at": post.created_at.isoformat(),
+            "is_owner": post.user_id == user.id,
+            "email": user_dict.get(post.user_id, "Unknown")
+        }
+        for post in posts
+    ]
 
     return {"posts": posts_data}
 
 
+# ---------------- Delete Post ----------------
 @app.delete("/posts/{post_id}")
-async def delete_post(post_id: str, session: AsyncSession = Depends(get_async_session), user: User = Depends(current_active_user),):
+async def delete_post(
+        post_id: str,
+        session: AsyncSession = Depends(get_async_session),
+        user: User = Depends(current_active_user),
+):
     try:
         post_uuid = uuid.UUID(post_id)
 
@@ -112,11 +145,12 @@ async def delete_post(post_id: str, session: AsyncSession = Depends(get_async_se
             raise HTTPException(status_code=404, detail="Post not found")
 
         if post.user_id != user.id:
-            raise HTTPException(status_code=403, detail="You don't have permission to delete this post")
+            raise HTTPException(status_code=403, detail="You don't have permission")
 
         await session.delete(post)
         await session.commit()
 
-        return {"success": True, "message": "Post deleted successfully"}
+        return {"success": True, "message": "Post deleted"}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
